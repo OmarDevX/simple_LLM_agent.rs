@@ -93,6 +93,31 @@ async fn run_agent(
     let mut memory = Memory::default();
 
     while iterations < max_iterations && state != AgentState::Done {
+        if state == AgentState::Observe {
+            let summary = make_observation_summary(&memory);
+            println!("👀 OBSERVATION (host):\n{}\n", summary);
+            messages
+                .push(json!({"role":"user","content":format!("OBSERVATION SUMMARY:\n{summary}")}));
+            state = AgentState::Evaluate;
+            continue;
+        }
+        if state == AgentState::Evaluate {
+            let done = can_mark_done(&memory, &task_prompt);
+            let evaluation = if done {
+                "All host validation gates passed. You may reply DONE.".to_string()
+            } else {
+                "Not done yet: keep acting. Prioritize concrete edits + validation commands; avoid repeating prior analysis.".to_string()
+            };
+            println!("🧪 EVALUATION (host): {}", evaluation);
+            messages.push(json!({"role":"user","content":evaluation}));
+            state = if done {
+                AgentState::Done
+            } else {
+                AgentState::Act
+            };
+            continue;
+        }
+
         iterations += 1;
         println!("\n=== ITERATION {} | STATE {:?} ===", iterations, state);
 
@@ -206,44 +231,8 @@ async fn run_agent(
                 }
                 state = AgentState::Observe;
             }
-            AgentState::Observe => {
-                if !tool_calls.is_empty() {
-                    messages.push(json!({"role":"user","content":"Invalid transition: OBSERVE cannot call tools. Summarize observations only."}));
-                    continue;
-                }
-                if message["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-                {
-                    messages.push(json!({"role":"user","content":"OBSERVE must include a concise status report: what changed, what failed, and next step."}));
-                }
-                state = AgentState::Evaluate;
-            }
-            AgentState::Evaluate => {
-                if !tool_calls.is_empty() {
-                    messages.push(json!({"role":"user","content":"Invalid transition: EVALUATE cannot call tools. Decide ACT vs DONE with explicit criteria check."}));
-                    continue;
-                }
-                if message["content"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains("blocked")
-                {
-                    memory.stagnant_iterations += 1;
-                } else {
-                    memory.stagnant_iterations = 0;
-                }
-                if memory.stagnant_iterations >= 2 {
-                    messages.push(json!({
-                        "role":"user",
-                        "content":"You are stagnating. In next ACT you must do concrete progress: inspect target directory with Tree/ListFiles, create or modify required project files, and run a validating Bash command."
-                    }));
-                }
-                state = AgentState::Act;
-            }
+            AgentState::Observe => {}
+            AgentState::Evaluate => {}
             AgentState::Done => {}
         }
     }
@@ -520,4 +509,14 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
     let truncated: String = text.chars().take(max_chars).collect();
     format!("{truncated}\n...[truncated]")
+}
+
+fn make_observation_summary(memory: &Memory) -> String {
+    format!(
+        "- Files created: {:?}\n- Files modified: {:?}\n- Last errors: {:?}\n- Last test result present: {}",
+        memory.files_created,
+        memory.files_modified,
+        memory.last_errors,
+        memory.last_tool_output.is_some()
+    )
 }
