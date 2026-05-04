@@ -30,6 +30,7 @@ struct Memory {
     last_errors: Vec<String>,
     test_results: Vec<String>,
     last_tool_output: Option<String>,
+    saw_successful_bash: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ async fn run_agent(
         json!({ "role": "user", "content": prompt }),
     ];
 
+    let task_prompt = prompt.clone();
     let mut state = AgentState::Plan;
     let mut iterations = 0;
     let max_iterations = 20;
@@ -125,10 +127,16 @@ async fn run_agent(
                 memory.plan = Some(content.to_string());
                 memory.completion_criteria = extract_bullets(content);
             }
-            if state == AgentState::Evaluate && content.contains("DONE") {
-                state = AgentState::Done;
-                println!("✅ Agent reported DONE");
-                continue;
+            if state == AgentState::Evaluate && content.trim().contains("DONE") {
+                if can_mark_done(&memory, &task_prompt) {
+                    state = AgentState::Done;
+                    println!("✅ Agent reported DONE with validation evidence");
+                    continue;
+                }
+                messages.push(json!({
+                    "role":"user",
+                    "content":"DONE rejected: task correctness evidence is insufficient. You must produce/modify task files and run successful validation commands (tests/build/run) before DONE."
+                }));
             }
         }
 
@@ -201,13 +209,14 @@ async fn run_agent(
 
 fn make_state_prompt(state: AgentState, memory: &Memory) -> String {
     let mem = format!(
-        "Memory summary:\nPlan: {:?}\nCompletion: {:?}\nFiles created: {:?}\nFiles modified: {:?}\nErrors: {:?}\nTests: {:?}",
+        "Memory summary:\nPlan: {:?}\nCompletion: {:?}\nFiles created: {:?}\nFiles modified: {:?}\nErrors: {:?}\nTests: {:?}\nSaw successful bash: {}",
         memory.plan,
         memory.completion_criteria,
         memory.files_created,
         memory.files_modified,
         memory.last_errors,
-        memory.test_results
+        memory.test_results,
+        memory.saw_successful_bash
     );
 
     match state {
@@ -324,6 +333,9 @@ fn execute_tool(
                 exec.stderr
             );
             memory.test_results.push(summary.clone());
+            if exec.status_success {
+                memory.saw_successful_bash = true;
+            }
             if !exec.status_success {
                 let hint = classify_failure(&exec.stderr, &exec.stdout);
                 memory.last_errors.push(hint.to_string());
@@ -332,6 +344,28 @@ fn execute_tool(
         }
         _ => Ok(format!("unknown tool: {}", name)),
     }
+}
+
+fn can_mark_done(memory: &Memory, prompt: &str) -> bool {
+    let touched_files = !memory.files_created.is_empty() || !memory.files_modified.is_empty();
+    let has_successful_exec = memory.saw_successful_bash;
+    let task_keywords: Vec<String> = prompt
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 3)
+        .filter(|w| !["make", "build", "create", "using", "with", "simple"].contains(w))
+        .map(|w| w.to_string())
+        .collect();
+    let searchable = format!(
+        "{}\n{}",
+        memory.plan.as_deref().unwrap_or_default().to_lowercase(),
+        memory.test_results.join("\n").to_lowercase()
+    );
+    let mentions_task = task_keywords
+        .iter()
+        .take(3)
+        .all(|keyword| searchable.contains(keyword));
+    touched_files && has_successful_exec && mentions_task
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::error::Error>> {
