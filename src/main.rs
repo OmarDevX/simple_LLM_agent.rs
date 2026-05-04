@@ -2,6 +2,7 @@ use async_openai::{Client, config::OpenAIConfig};
 use clap::Parser;
 use serde_json::{Value, json};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -32,6 +33,7 @@ struct Memory {
     last_tool_output: Option<String>,
     saw_successful_bash: bool,
     stagnant_iterations: u32,
+    did_project_scan: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +89,7 @@ async fn run_agent(
     let task_prompt = prompt.clone();
     let mut state = AgentState::Plan;
     let mut iterations = 0;
-    let max_iterations = 20;
+    let max_iterations = 40;
     let mut memory = Memory::default();
 
     while iterations < max_iterations && state != AgentState::Done {
@@ -186,6 +188,12 @@ async fn run_agent(
 
                     messages.push(json!({"role":"tool","tool_call_id":id,"content":result}));
                 }
+                if !memory.did_project_scan {
+                    messages.push(json!({
+                        "role":"user",
+                        "content":"Before any further edits, you must inspect existing files with Tree/ListFiles and Read target files to avoid claiming files are missing."
+                    }));
+                }
                 state = AgentState::Observe;
             }
             AgentState::Observe => {
@@ -255,7 +263,7 @@ fn make_state_prompt(state: AgentState, memory: &Memory) -> String {
             "STATE=PLAN\nCreate numbered implementation plan and explicit completion criteria.\n{mem}"
         ),
         AgentState::Act => format!(
-            "STATE=ACT\nExecute next steps with tools. Before Bash, include self-critique (risk, deps, safety).\n{mem}"
+            "STATE=ACT\nExecute next steps with tools. Before Bash, include self-critique (risk, deps, safety).\nCRITICAL: before Write/Patch on a path, first inspect project structure (Tree/ListFiles) and Read the target file when it exists.\n{mem}"
         ),
         AgentState::Observe => {
             format!(
@@ -313,6 +321,7 @@ fn execute_tool(
     match name {
         "Read" => {
             let file_path = str_arg(args, "file_path")?;
+            memory.did_project_scan = true;
             Ok(std::fs::read_to_string(file_path)?)
         }
         "Write" => {
@@ -330,12 +339,13 @@ fn execute_tool(
         "Patch" => {
             let file_path = str_arg(args, "file_path")?;
             let diff = str_arg(args, "diff")?;
-            apply_simple_patch(file_path, diff)?;
+            apply_patch_with_tool(file_path, diff)?;
             push_unique(&mut memory.files_modified, file_path);
             Ok("patch applied".to_string())
         }
         "ListFiles" => {
             let path = str_arg(args, "path")?;
+            memory.did_project_scan = true;
             let mut files = vec![];
             for entry in std::fs::read_dir(path)? {
                 let e = entry?;
@@ -346,6 +356,7 @@ fn execute_tool(
         }
         "Tree" => {
             let path = str_arg(args, "path")?;
+            memory.did_project_scan = true;
             let mut out = vec![];
             tree_walk(Path::new(path), 0, &mut out)?;
             Ok(out.join("\n"))
@@ -436,18 +447,23 @@ fn enforce_safe_command(command: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn apply_simple_patch(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let original = std::fs::read_to_string(file_path)?;
-    let mut updated = original.clone();
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("- ") {
-            updated = updated.replace(rest, "");
-        } else if let Some(rest) = line.strip_prefix("+ ") {
-            updated.push_str(rest);
-            updated.push('\n');
-        }
+fn apply_patch_with_tool(file_path: &str, diff: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let patch_text = if diff.contains("*** Begin Patch") {
+        diff.to_string()
+    } else {
+        return Err("Patch tool requires full apply_patch format".into());
+    };
+
+    let tmp_patch = ".agent_tmp.patch";
+    fs::write(tmp_patch, patch_text)?;
+    let output = Command::new("apply_patch").arg(tmp_patch).output()?;
+    let _ = fs::remove_file(tmp_patch);
+    if !output.status.success() {
+        return Err(format!("patch failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
-    std::fs::write(file_path, updated)?;
+    if !Path::new(file_path).exists() {
+        return Err(format!("patch reported success but target file missing: {file_path}").into());
+    }
     Ok(())
 }
 
