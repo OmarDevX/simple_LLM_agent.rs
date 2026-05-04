@@ -31,6 +31,7 @@ struct Memory {
     test_results: Vec<String>,
     last_tool_output: Option<String>,
     saw_successful_bash: bool,
+    stagnant_iterations: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,9 @@ async fn run_agent(
         messages.push(message.clone());
 
         if let Some(content) = message["content"].as_str() {
+            if !content.trim().is_empty() {
+                println!("🧠 ASSISTANT ({:?}):\n{}\n", state, content);
+            }
             if state == AgentState::Plan {
                 memory.plan = Some(content.to_string());
                 memory.completion_criteria = extract_bullets(content);
@@ -165,6 +169,7 @@ async fn run_agent(
                     let id = tool_call["id"].as_str().unwrap_or_default();
                     let name = tool_call["function"]["name"].as_str().unwrap_or_default();
                     let args_str = tool_call["function"]["arguments"].as_str().unwrap_or("{}");
+                    println!("🔧 TOOL CALL: {} | args={}", name, args_str);
                     let args: Value = match serde_json::from_str(args_str) {
                         Ok(v) => v,
                         Err(e) => {
@@ -177,6 +182,7 @@ async fn run_agent(
 
                     let result = execute_tool(name, &args, &mut memory)?;
                     memory.last_tool_output = Some(result.clone());
+                    println!("📤 TOOL RESULT [{}]:\n{}\n", name, truncate(&result, 1200));
 
                     messages.push(json!({"role":"tool","tool_call_id":id,"content":result}));
                 }
@@ -187,12 +193,36 @@ async fn run_agent(
                     messages.push(json!({"role":"user","content":"Invalid transition: OBSERVE cannot call tools. Summarize observations only."}));
                     continue;
                 }
+                if message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
+                    messages.push(json!({"role":"user","content":"OBSERVE must include a concise status report: what changed, what failed, and next step."}));
+                }
                 state = AgentState::Evaluate;
             }
             AgentState::Evaluate => {
                 if !tool_calls.is_empty() {
                     messages.push(json!({"role":"user","content":"Invalid transition: EVALUATE cannot call tools. Decide ACT vs DONE with explicit criteria check."}));
                     continue;
+                }
+                if message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains("blocked")
+                {
+                    memory.stagnant_iterations += 1;
+                } else {
+                    memory.stagnant_iterations = 0;
+                }
+                if memory.stagnant_iterations >= 2 {
+                    messages.push(json!({
+                        "role":"user",
+                        "content":"You are stagnating. In next ACT you must do concrete progress: inspect target directory with Tree/ListFiles, create or modify required project files, and run a validating Bash command."
+                    }));
                 }
                 state = AgentState::Act;
             }
@@ -209,14 +239,15 @@ async fn run_agent(
 
 fn make_state_prompt(state: AgentState, memory: &Memory) -> String {
     let mem = format!(
-        "Memory summary:\nPlan: {:?}\nCompletion: {:?}\nFiles created: {:?}\nFiles modified: {:?}\nErrors: {:?}\nTests: {:?}\nSaw successful bash: {}",
+        "Memory summary:\nPlan: {:?}\nCompletion: {:?}\nFiles created: {:?}\nFiles modified: {:?}\nErrors: {:?}\nTests: {:?}\nSaw successful bash: {}\nStagnant iterations: {}",
         memory.plan,
         memory.completion_criteria,
         memory.files_created,
         memory.files_modified,
         memory.last_errors,
         memory.test_results,
-        memory.saw_successful_bash
+        memory.saw_successful_bash,
+        memory.stagnant_iterations
     );
 
     match state {
@@ -227,10 +258,12 @@ fn make_state_prompt(state: AgentState, memory: &Memory) -> String {
             "STATE=ACT\nExecute next steps with tools. Before Bash, include self-critique (risk, deps, safety).\n{mem}"
         ),
         AgentState::Observe => {
-            format!("STATE=OBSERVE\nSummarize tool outputs and facts only.\n{mem}")
+            format!(
+                "STATE=OBSERVE\nSummarize tool outputs and facts only. REQUIRED FORMAT:\n- Changed files\n- Command results\n- Remaining blockers\n- Next step\n{mem}"
+            )
         }
         AgentState::Evaluate => format!(
-            "STATE=EVALUATE\nCheck completion criteria explicitly with pass/fail per criterion. Reply DONE if all pass; otherwise explain what remains.\n{mem}"
+            "STATE=EVALUATE\nCheck completion criteria explicitly with pass/fail per criterion. Reply DONE if all pass; otherwise explain what remains and give exact next ACT actions.\n{mem}"
         ),
         AgentState::Done => "STATE=DONE".to_string(),
     }
@@ -446,4 +479,12 @@ fn push_unique(items: &mut Vec<String>, value: &str) {
     if !items.iter().any(|v| v == value) {
         items.push(value.to_string());
     }
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars).collect();
+    format!("{truncated}\n...[truncated]")
 }
