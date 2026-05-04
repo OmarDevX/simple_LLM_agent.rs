@@ -182,7 +182,17 @@ async fn run_agent(
                         }
                     };
 
-                    let result = execute_tool(name, &args, &mut memory)?;
+                    let result = match execute_tool(name, &args, &mut memory) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let err = format!(
+                                "TOOL_ERROR: tool `{}` failed.\nReason: {}\nFix the arguments/path and retry.",
+                                name, e
+                            );
+                            memory.last_errors.push(err.clone());
+                            err
+                        }
+                    };
                     memory.last_tool_output = Some(result.clone());
                     println!("📤 TOOL RESULT [{}]:\n{}\n", name, truncate(&result, 1200));
 
@@ -320,12 +330,12 @@ fn execute_tool(
 ) -> Result<String, Box<dyn std::error::Error>> {
     match name {
         "Read" => {
-            let file_path = str_arg(args, "file_path")?;
+            let file_path = normalize_path_arg(args, "file_path");
             memory.did_project_scan = true;
             Ok(std::fs::read_to_string(file_path)?)
         }
         "Write" => {
-            let file_path = str_arg(args, "file_path")?;
+            let file_path = normalize_path_arg(args, "file_path");
             let content = str_arg(args, "content")?;
             let existed = Path::new(file_path).exists();
             std::fs::write(file_path, content)?;
@@ -337,14 +347,14 @@ fn execute_tool(
             Ok("file written".to_string())
         }
         "Patch" => {
-            let file_path = str_arg(args, "file_path")?;
+            let file_path = normalize_path_arg(args, "file_path");
             let diff = str_arg(args, "diff")?;
             apply_patch_with_tool(file_path, diff)?;
             push_unique(&mut memory.files_modified, file_path);
             Ok("patch applied".to_string())
         }
         "ListFiles" => {
-            let path = str_arg(args, "path")?;
+            let path = normalize_path_arg(args, "path");
             memory.did_project_scan = true;
             let mut files = vec![];
             for entry in std::fs::read_dir(path)? {
@@ -355,7 +365,7 @@ fn execute_tool(
             Ok(files.join("\n"))
         }
         "Tree" => {
-            let path = str_arg(args, "path")?;
+            let path = normalize_path_arg(args, "path");
             memory.did_project_scan = true;
             let mut out = vec![];
             tree_walk(Path::new(path), 0, &mut out)?;
@@ -416,6 +426,13 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::error
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing {key}").into())
+}
+
+fn normalize_path_arg<'a>(args: &'a Value, key: &str) -> &'a str {
+    match args.get(key).and_then(Value::as_str) {
+        Some(v) if !v.trim().is_empty() => v,
+        _ => ".",
+    }
 }
 
 fn run_bash(command: &str) -> Result<ExecResult, Box<dyn std::error::Error>> {
